@@ -21,6 +21,7 @@ final class Panel {
     let sdrNits: Double     // потолок SDR штатного пресета, 600
 
     private typealias FnGetIdx = @convention(c) (CGDirectDisplayID) -> Int32
+    private typealias FnCount  = @convention(c) (CGDirectDisplayID) -> Int32
     private typealias FnSetIdx = @convention(c) (CGDirectDisplayID, Int32) -> Int32
     private typealias FnCopy   = @convention(c) (CGDirectDisplayID, Int32) -> Unmanaged<CFDictionary>?
     private typealias FnSetALS = @convention(c) (CGDirectDisplayID, Bool) -> Int32
@@ -29,6 +30,7 @@ final class Panel {
     private typealias FnSetB   = @convention(c) (CGDirectDisplayID, Float) -> Int32
 
     private let getIdx: FnGetIdx, setIdx: FnSetIdx, copyPreset: FnCopy
+    private let presetCount: Int32
     private let setALS: FnSetALS?, getALS: FnGetALS?
     private let getB: FnGetB?, setB: FnSetB?
 
@@ -41,6 +43,7 @@ final class Panel {
         getIdx = unsafeBitCast(a, to: FnGetIdx.self)
         setIdx = unsafeBitCast(b, to: FnSetIdx.self)
         copyPreset = unsafeBitCast(c, to: FnCopy.self)
+        let count = dlsym(cd, "CoreDisplay_Display_GetPresetCount").map { unsafeBitCast($0, to: FnCount.self) }
 
         let ds = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW)
         setALS = dlsym(ds, "DisplayServicesEnableAmbientLightCompensation").map { unsafeBitCast($0, to: FnSetALS.self) }
@@ -48,15 +51,19 @@ final class Panel {
         getB = dlsym(ds, "DisplayServicesGetBrightness").map { unsafeBitCast($0, to: FnGetB.self) }
         setB = dlsym(ds, "DisplayServicesSetBrightness").map { unsafeBitCast($0, to: FnSetB.self) }
 
+        // Online, а не Active: при закрытой крышке встроенный экран выпадает
+        // из активных, но может оставаться в списке подключённых.
         var n: UInt32 = 0
-        CGGetActiveDisplayList(0, nil, &n)
+        CGGetOnlineDisplayList(0, nil, &n)
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
-        CGGetActiveDisplayList(n, &ids, &n)
+        CGGetOnlineDisplayList(n, &ids, &n)
         guard let d = ids.first(where: { CGDisplayIsBuiltin($0) != 0 }),
               let fb = Self.builtinFramebuffer()
         else { return nil }
         display = d
         framebuffer = fb
+        let reported = count?(d) ?? 0
+        presetCount = reported > 0 ? reported : 32
 
         func nits(_ key: String) -> Double? {
             (IORegistryEntryCreateCFProperty(fb, key as CFString, nil, 0)?.takeRetainedValue() as? Int)
@@ -71,14 +78,26 @@ final class Panel {
             .takeRetainedValue() as? Int
         minNits = Double(max(floor ?? 2, 1))
 
-        var sdr = 600.0
-        for i in 0..<Int32(32) {
+        // Без HDR-пресета это не XDR-панель (MacBook Air и т. п.) — расширять нечего.
+        var hdr: (Int32, Double)?
+        for i in 0..<presetCount {
             if let p = copyPreset(d, i)?.takeRetainedValue() as? [String: Any],
                let s = p["PresetMaxSDRLuminance"] as? Int, let h = p["PresetMaxHDRLuminance"] as? Int, h > s {
-                sdr = Double(s); break
+                hdr = (i, Double(s)); break
             }
         }
-        sdrNits = sdr
+        guard let hdr, peak > hdr.1 + 1 else { return nil }
+        hdrPreset = hdr.0
+        sdrNits = hdr.1
+        lastNits = sdrNits
+    }
+
+    /// Есть ли в этом Mac встроенная XDR-панель вообще, даже если сейчас
+    /// она выключена (закрытая крышка).
+    static var hasPanelHardware: Bool {
+        guard let fb = builtinFramebuffer() else { return false }
+        IOObjectRelease(fb)
+        return true
     }
 
     /// Встроенный фреймбуфер — тот, у которого есть потолок подсветки BLNitsCap.
@@ -88,7 +107,7 @@ final class Panel {
         else { return nil }
         defer { IOObjectRelease(it) }
         while case let s = IOIteratorNext(it), s != 0 {
-            if IORegistryEntryCreateCFProperty(s, "BLNitsCap" as CFString, nil, 0) != nil { return s }
+            if let v = IORegistryEntryCreateCFProperty(s, "BLNitsCap" as CFString, nil, 0) { v.release(); return s }
             IOObjectRelease(s)
         }
         return nil
@@ -96,24 +115,35 @@ final class Panel {
 
     // ── Подсветка ─────────────────────────────────────────────────────────────
 
-    var nits: Double { read("IOMFBBrightnessLevel") }
+    /// Текущая подсветка. Если свойство не прочиталось, — последнее известное
+    /// значение, а не 0: иначе следующий переход стартовал бы из темноты.
+    var nits: Double {
+        if let v = read("IOMFBBrightnessLevel"), v > 0 { lastNits = v }
+        return lastNits
+    }
+    private var lastNits: Double
 
     @discardableResult
     func setNits(_ value: Double) -> Bool {
         let v = min(max(value, minNits), peakNits)
-        return write("IOMFBBrightnessLevel", v)
+        guard write("IOMFBBrightnessLevel", v) else { return false }
+        lastNits = v
+        return true
     }
+
+    /// Экран включён и не спит — только тогда в него есть смысл писать.
+    var isAwake: Bool { CGDisplayIsActive(display) != 0 && CGDisplayIsAsleep(display) == 0 }
 
     /// Потолок подсветки. На пресете без HDR система ставит его равным SDR
     /// (600), и всё, что выше, драйвер обрезает. Поднимаем до пика панели.
-    var capNits: Double { read("BLNitsCap") }
+    var capNits: Double { read("BLNitsCap") ?? peakNits }
 
     @discardableResult
     func unlockCap() -> Bool { capNits >= peakNits - 0.5 || write("BLNitsCap", peakNits) }
 
-    private func read(_ key: String) -> Double {
+    private func read(_ key: String) -> Double? {
         guard let v = IORegistryEntryCreateCFProperty(framebuffer, key as CFString, nil, 0)?
-            .takeRetainedValue() as? Int else { return 0 }
+            .takeRetainedValue() as? Int else { return nil }
         return Double(v) / 65536
     }
 
@@ -133,7 +163,7 @@ final class Panel {
     /// На нём WindowServer не трогает подсветку, и прямая запись держится.
     lazy var directPreset: Int32? = {
         var best: (Int32, Int)?
-        for i in 0..<Int32(32) {
+        for i in 0..<presetCount {
             guard let p = copyPreset(display, i)?.takeRetainedValue() as? [String: Any],
                   let s = p["PresetMaxSDRLuminance"] as? Int, let h = p["PresetMaxHDRLuminance"] as? Int,
                   h == s, s > (best?.1 ?? 0) else { continue }
@@ -141,6 +171,9 @@ final class Panel {
         }
         return best?.0
     }()
+
+    /// Штатный пресет с HDR — «Apple XDR Display (P3-1600 nits)».
+    let hdrPreset: Int32
 
     @discardableResult
     func selectPreset(_ i: Int32) -> Bool {

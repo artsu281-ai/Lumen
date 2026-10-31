@@ -26,6 +26,8 @@ final class MenuPanel: NSView {
     private let accessBanner = Banner(text: "Без Универсального доступа клавиши F1/F2 меняют яркость в обход Lumen.",
                                       button: "Открыть настройки")
     private let enabledRow = ToggleRow("Lumen управляет яркостью")
+    private let enabledNote = NSTextField(wrappingLabelWithString:
+        "Пока включено, HDR, автояркость и пресеты экрана macOS не действуют.")
     private let keysRow = ToggleRow("Клавиши яркости через Lumen")
     private let loginRow = ToggleRow("Открывать при входе в систему")
     private let stack = NSStackView()
@@ -44,6 +46,7 @@ final class MenuPanel: NSView {
         readout.spacing = 4
 
         gauge.onChange = { [weak self] in self?.onPosition?($0) }
+        gauge.setAccessibilityLabel("Яркость")
 
         chips.distribution = .equalSpacing
         for level in levels {
@@ -59,9 +62,15 @@ final class MenuPanel: NSView {
         keysRow.onChange = { [weak self] in self?.onKeys?($0) }
         loginRow.onChange = { [weak self] in self?.onLogin?($0) }
 
-        let toggles = NSStackView(views: [enabledRow, keysRow, loginRow])
+        enabledNote.font = .systemFont(ofSize: 11)
+        enabledNote.textColor = .secondaryLabelColor
+        enabledNote.preferredMaxLayoutWidth = Self.width - 28
+        let toggles = NSStackView(views: [enabledRow, enabledNote, keysRow, loginRow])
         toggles.orientation = .vertical
+        toggles.alignment = .leading
         toggles.spacing = 2
+        toggles.setCustomSpacing(8, after: enabledNote)
+        for row in [enabledRow, keysRow, loginRow] { row.widthAnchor.constraint(equalTo: toggles.widthAnchor).isActive = true }
 
         for v in [readout, gauge, chips, bdBanner, accessBanner, Divider(), toggles] as [NSView] {
             stack.addArrangedSubview(v)
@@ -89,20 +98,28 @@ final class MenuPanel: NSView {
 
     struct State {
         var nits: Double, position: Double, sdrMark: Double, percent: Int
-        var boosted: Bool, engaged: Bool, keys: Bool, login: Bool
+        var boosted: Bool, engaged: Bool
+        var limitedTo: Double?            // macOS сообщила о нагреве — столько сейчас на самом деле
+        var keys: Bool, login: Bool
         var betterDisplay: Bool, needsAccess: Bool
     }
 
     func update(_ s: State) {
         value.stringValue = "\(Int(s.nits.rounded()))"
-        badge.stringValue = !s.engaged ? "яркостью управляет macOS" : s.boosted ? "XDR  \(s.percent) %" : "\(s.percent) %"
-        badge.textColor = s.engaged && s.boosted ? .systemYellow : .secondaryLabelColor
+        if let limit = s.limitedTo {
+            badge.stringValue = "нагрев: до \(Int(limit.rounded())) нит"
+            badge.textColor = .systemOrange
+        } else {
+            badge.stringValue = !s.engaged ? "яркостью управляет macOS" : s.boosted ? "XDR  \(s.percent) %" : "\(s.percent) %"
+            badge.textColor = s.engaged && s.boosted ? .systemYellow : .secondaryLabelColor
+        }
         badge.font = .systemFont(ofSize: s.engaged ? 13 : 11, weight: s.engaged ? .semibold : .regular).rounded
         value.textColor = s.engaged ? .labelColor : .tertiaryLabelColor
 
         gauge.position = s.position
         gauge.sdrMark = s.sdrMark
         gauge.isEnabled = s.engaged
+        gauge.setAccessibilityValue("\(Int(s.nits.rounded())) нит")
         if !gauge.isTracking { gauge.needsDisplay = true }
 
         for c in chipViews {
@@ -167,7 +184,9 @@ private final class Gauge: NSView {
         let name = position < 0.08 ? "sun.min.fill" : boosted ? "sun.max.fill" : "sun.max"
         let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .bold)
         if let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
-            let tint = NSColor.black.withAlphaComponent(0.7 * alpha)
+            // значок лежит на белой части шкалы, а она — цвета текста:
+            // в тёмной теме белая, в светлой почти чёрная
+            let tint = onInk(self).withAlphaComponent(0.7 * alpha)
             let s = img.size
             let rect = NSRect(x: 9, y: (r.height - s.height) / 2, width: s.width, height: s.height)
             tinted(img, tint).draw(in: rect)
@@ -194,16 +213,6 @@ private final class Gauge: NSView {
         return p
     }
 
-    private func tinted(_ img: NSImage, _ color: NSColor) -> NSImage {
-        let out = NSImage(size: img.size)
-        out.lockFocus()
-        img.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 1)
-        color.set()
-        NSRect(origin: .zero, size: img.size).fill(using: .sourceAtop)
-        out.unlockFocus()
-        return out
-    }
-
     // В меню обычные mouseDragged не приходят — ведём перетаскивание сами.
     override func mouseDown(with event: NSEvent) {
         guard isEnabled, let window else { return }
@@ -221,11 +230,25 @@ private final class Gauge: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard isEnabled else { return }
-        position = min(max(position + Double(event.scrollingDeltaY) / 400, 0), 1)
+        // инерция трекпада после того, как палец ушёл, шкалу не тянет
+        guard isEnabled, event.momentumPhase.isEmpty, event.scrollingDeltaY != 0 else { return }
+        // трекпад даёт точные пиксели, колёсико мыши — по единице на щелчок
+        let delta = event.hasPreciseScrollingDeltas ? Double(event.scrollingDeltaY) / 400
+                                                    : (event.scrollingDeltaY > 0 ? 1.0 : -1.0) / 32
+        nudge(delta)
+    }
+
+    private func nudge(_ delta: Double) {
+        position = min(max(position + delta, 0), 1)
         needsDisplay = true
         onChange?(position)
     }
+
+    // VoiceOver: это ползунок
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .slider }
+    override func accessibilityPerformIncrement() -> Bool { guard isEnabled else { return false }; nudge(1.0 / 16); return true }
+    override func accessibilityPerformDecrement() -> Bool { guard isEnabled else { return false }; nudge(-1.0 / 16); return true }
 }
 
 // ── Кнопка уровня ─────────────────────────────────────────────────────────────
@@ -260,6 +283,14 @@ private final class Chip: NSView {
             label.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
         toolTip = "\(Int(nits)) нит"
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("\(Int(nits)) нит")
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled else { return false }
+        onTap?(); return true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -275,14 +306,11 @@ private final class Chip: NSView {
         let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
         guard let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
         else { return }
-        let tint: NSColor = isOn ? .black.withAlphaComponent(0.8) : (isXDR ? .systemYellow : .labelColor)
-        let out = NSImage(size: img.size)
-        out.lockFocus()
-        img.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 1)
-        tint.set()
-        NSRect(origin: .zero, size: img.size).fill(using: .sourceAtop)
-        out.unlockFocus()
-        out.draw(in: NSRect(x: circle.midX - img.size.width / 2, y: circle.midY - img.size.height / 2,
+        // выбранный уровень залит цветом текста (или жёлтым для XDR) —
+        // значок на нём цвета фона, чтобы не потеряться ни в одной теме
+        let tint: NSColor = isOn ? (isXDR ? .black.withAlphaComponent(0.8) : onInk(self))
+                                 : (isXDR ? .systemYellow : .labelColor)
+        tinted(img, tint).draw(in: NSRect(x: circle.midX - img.size.width / 2, y: circle.midY - img.size.height / 2,
                             width: img.size.width, height: img.size.height))
     }
 
@@ -300,11 +328,14 @@ private final class Chip: NSView {
 private final class ToggleRow: NSView {
 
     var onChange: ((Bool) -> Void)?
-    var isOn = false { didSet { knob.isOn = isOn } }
+    var isOn = false { didSet { knob.isOn = isOn; setAccessibilityValue(isOn ? 1 : 0) } }
     private let knob = Switch()
 
     init(_ title: String) {
         super.init(frame: .zero)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.checkBox)
+        setAccessibilityLabel(title)
         let label = NSTextField(labelWithString: title)
         label.font = .systemFont(ofSize: 13)
         for v in [label, knob] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
@@ -324,6 +355,12 @@ private final class ToggleRow: NSView {
     // щёлкнуть можно по всей строке, не только по переключателю
     override func mouseDown(with event: NSEvent) {
         guard trackClick(self, event) else { return }
+        flip()
+    }
+
+    override func accessibilityPerformPress() -> Bool { flip(); return true }
+
+    private func flip() {
         isOn.toggle()
         onChange?(isOn)
     }
@@ -398,6 +435,21 @@ private func trackClick(_ view: NSView, _ down: NSEvent) -> Bool {
         if e.type == .leftMouseUp { return view.bounds.contains(view.convert(e.locationInWindow, from: nil)) }
     }
     return false
+}
+
+/// Цвет значка поверх заливки цвета текста: в тёмной теме чёрный, в светлой белый.
+private func onInk(_ view: NSView) -> NSColor {
+    view.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .black : .white
+}
+
+/// Перекрашенный символ SF без lockFocus: рисуется в момент вывода.
+private func tinted(_ img: NSImage, _ color: NSColor) -> NSImage {
+    NSImage(size: img.size, flipped: false) { r in
+        img.draw(in: r)
+        color.set()
+        r.fill(using: .sourceAtop)
+        return true
+    }
 }
 
 private final class Divider: NSBox {

@@ -10,6 +10,7 @@ final class HUD {
     private let bar = Bar()
     private let label = NSTextField(labelWithString: "")
     private var hide: DispatchWorkItem?
+    private var shown = 0
 
     init() {
         window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 52),
@@ -24,9 +25,16 @@ final class HUD {
         let fx = NSVisualEffectView(frame: window.contentRect(forFrameRect: window.frame))
         fx.material = .hudWindow
         fx.state = .active
-        fx.wantsLayer = true
-        fx.layer?.cornerRadius = 26
-        fx.layer?.cornerCurve = .continuous
+        // скругление маской, а не cornerRadius слоя: так по форме режутся и
+        // размытие подложки, и тень окна
+        let mask = NSImage(size: NSSize(width: 52, height: 52), flipped: false) { r in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: r, xRadius: 26, yRadius: 26).fill()
+            return true
+        }
+        mask.capInsets = NSEdgeInsets(top: 26, left: 26, bottom: 26, right: 26)
+        mask.resizingMode = .stretch
+        fx.maskImage = mask
         window.contentView = fx
 
         icon.symbolConfiguration = .init(pointSize: 17, weight: .semibold)
@@ -61,13 +69,22 @@ final class HUD {
             let f = screen.visibleFrame
             window.setFrameOrigin(NSPoint(x: f.maxX - window.frame.width - 12, y: f.maxY - window.frame.height - 10))
         }
-        window.alphaValue = 1
-        window.orderFrontRegardless()
-
+        // гашение могло уже идти: обрываем его анимацией нулевой длины
+        // (простое присваивание alphaValue анимацию не отменяет), а его
+        // завершение по номеру показа узнает, что оно устарело
         hide?.cancel()
+        shown += 1
+        let generation = shown
+        NSAnimationContext.runAnimationGroup { $0.duration = 0; window.animator().alphaValue = 1 }
+        window.orderFrontRegardless()
+        window.invalidateShadow()
+
         let w = DispatchWorkItem { [weak self] in
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.35; self?.window.animator().alphaValue = 0 },
-                                                 completionHandler: { self?.window.orderOut(nil) })
+                                                 completionHandler: {
+                guard let self, self.shown == generation else { return }
+                self.window.orderOut(nil)
+            })
         }
         hide = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4, execute: w)
