@@ -1,0 +1,6 @@
+.DS_Store
+build/
+# скомпилированные зонды — исходники .swift лежат рядом
+probe/*
+!probe/*.swift
+!probe/dis.sh
