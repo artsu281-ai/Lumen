@@ -110,12 +110,15 @@ final class MenuPanel: NSView {
             c.isXDR = c.nits > sdrNits + 0.5
             c.isEnabled = s.engaged
         }
+        let relayout = bdBanner.isHidden == s.betterDisplay || accessBanner.isHidden == s.needsAccess
         bdBanner.isHidden = !s.betterDisplay
         accessBanner.isHidden = !s.needsAccess
         enabledRow.isOn = s.engaged
         keysRow.isOn = s.keys
         loginRow.isOn = s.login
-        setFrameSize(fittingSize)
+        // пересчёт вёрстки дорогой — только когда плашки появились или ушли,
+        // а не на каждое движение ползунка
+        if relayout || frame.height < 100 { setFrameSize(fittingSize) }
     }
 
     /// Штатный потолок: всё выше — зона XDR.

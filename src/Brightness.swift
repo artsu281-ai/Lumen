@@ -14,8 +14,17 @@ final class Brightness {
 
     private(set) var engaged = false
     private(set) var targetNits: Double
-    private var rampTimer: Timer?
     private var watchdog: Timer?
+
+    // Следящий двигатель: каждый кадр экрана ведёт подсветку к цели
+    // критически демпфированной пружиной по логарифму нит — мягкий разгон,
+    // мягкая остановка, без перелёта. Новые нажатия только двигают цель, а
+    // набранная скорость сохраняется — нет ни «едет-стоп-едет», ни рывка.
+    private lazy var clock = FrameClock(screen: panel.display) { [weak self] dt in self?.follow(dt) }
+    private var shownNits = 0.0
+    private var velocity = 0.0           // лог-нит в секунду
+    private var smoothTime = 0.12
+    private var animating: Bool { clock.isRunning }
 
     init(panel: Panel) {
         self.panel = panel
@@ -54,7 +63,10 @@ final class Brightness {
         defaults.set(targetNits, forKey: "nits")
         NotificationCenter.default.post(name: Self.changed, object: self)
         guard engaged else { return }
-        animated ? ramp(to: targetNits) : apply()
+        // клавиши и уровни — мягко, ползунок — почти вплотную за пальцем
+        smoothTime = animated ? 0.12 : 0.05
+        if !animating { shownNits = max(panel.nits, panel.minNits); velocity = 0 }
+        clock.start()
     }
 
     // ── Захват панели ─────────────────────────────────────────────────────────
@@ -73,6 +85,7 @@ final class Brightness {
         panel.setAutoBrightness(false)
         panel.setSystemBrightness(1)
         panel.selectPreset(direct)
+        pinSystem()   // пресет подгружает свою сохранённую яркость — перебиваем её
         engaged = true
         reassertSoon()
 
@@ -83,7 +96,7 @@ final class Brightness {
 
     /// Отдаёт подсветку системе: исходный пресет, исходная автояркость.
     func release() {
-        rampTimer?.invalidate(); rampTimer = nil
+        clock.stop()
         watchdog?.invalidate(); watchdog = nil
         holdTimer?.invalidate(); holdTimer = nil
         engaged = false
@@ -107,13 +120,14 @@ final class Brightness {
     func reassertSoon() {
         guard engaged else { return }
         if let direct = panel.directPreset { panel.selectPreset(direct) }
+        pinSystem()
         holdUntil = Date().addingTimeInterval(3)
         guard holdTimer == nil else { return }
         holdTimer = Timer.common(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] t in
             guard let self, self.engaged, Date() < self.holdUntil else {
                 t.invalidate(); self?.holdTimer = nil; return
             }
-            if self.rampTimer == nil, abs(self.panel.nits - self.targetNits) > 0.5 { self.apply() }
+            if !self.animating, abs(self.panel.nits - self.targetNits) > 0.5 { self.apply() }
         }
     }
 
@@ -128,26 +142,100 @@ final class Brightness {
     /// Сторож: если подсветку кто-то перезаписал (штатные клавиши, Пункт
     /// управления, сон), возвращаем своё значение.
     private func guardLevel() {
-        guard engaged, rampTimer == nil else { return }
+        guard engaged else { return }
+        pinSystem()
+        guard !animating else { return }
         if let direct = panel.directPreset, panel.activePreset != direct {
             reassertSoon(); return
         }
         if abs(panel.nits - targetNits) > 0.5 || targetNits > panel.capNits + 0.5 { apply() }
     }
 
-    /// Плавный переход за ~180 мс по логарифму нит — так он ровный на глаз.
-    private func ramp(to goal: Double) {
-        rampTimer?.invalidate()
-        let start = max(panel.nits, panel.minNits)
-        let frames = 11
-        var i = 0
-        rampTimer = Timer.common(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] t in
-            guard let self else { t.invalidate(); return }
-            i += 1
-            let k = Double(i) / Double(frames)
-            self.panel.setNits(exp(log(start) + (log(goal) - log(start)) * k))
-            if i >= frames { t.invalidate(); self.rampTimer = nil; self.apply() }
+    /// Штатная яркость macOS — это то, что WindowServer считает белым SDR.
+    /// Ниже 1 он видит запас под HDR и при любом видео притемняет весь
+    /// интерфейс, хотя подсветку держим мы, — экран «мигает» вместе с роликом.
+    /// На 1 белый SDR равен потолку пресета, запаса нет, затемнять нечем.
+    private func pinSystem() {
+        if let v = panel.systemBrightness, v < 0.999 { panel.setSystemBrightness(1) }
+        if panel.autoBrightness == true { panel.setAutoBrightness(false) }
+    }
+
+    private func follow(_ dt: Double) {
+        guard engaged else { clock.stop(); return }
+        let goal = log(targetNits), now = log(max(shownNits, panel.minNits))
+        let next = smoothDamp(now, goal, dt)
+        if abs(next - goal) < 0.002 && abs(velocity) < 0.05 {   // < 0,2 % — глазу не видно, встаём
+            shownNits = targetNits
+            velocity = 0
+            apply()
+            clock.stop()
+        } else {
+            shownNits = exp(next)
+            if shownNits > panel.capNits { panel.unlockCap() }
+            panel.setNits(shownNits)
         }
+    }
+}
+
+extension Brightness {
+    /// Пружина SmoothDamp (Game Programming Gems 4, 1.10): плавно догоняет
+    /// цель за ~smoothTime, скорость не больше maxSpeed — даже с 2 до 1600
+    /// нит переход растягивается, а не прыгает.
+    fileprivate func smoothDamp(_ current: Double, _ target: Double, _ dt: Double) -> Double {
+        let maxSpeed = 3.5                       // лог-нит/с: не быстрее ×33 за секунду
+        let omega = 2 / smoothTime, x = omega * dt
+        let k = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+        let limit = maxSpeed * smoothTime
+        let change = min(max(current - target, -limit), limit)
+        let temp = (velocity + omega * change) * dt
+        velocity = (velocity - omega * temp) * k
+        var out = (current - change) + (change + temp) * k
+        if (target - current > 0) == (out > target) { out = target; velocity = 0 }   // без перелёта
+        // жёсткий потолок: не больше ~3 % яркости за кадр на 120 Гц —
+        // мельче порога, на котором глаз видит ступеньку на ровном фоне
+        let step = min(maxSpeed * dt, 0.025)     // и за пропущенный кадр не больше
+        if abs(out - current) > step {
+            out = current + (out > current ? step : -step)
+            velocity = min(max(velocity, -maxSpeed), maxSpeed)
+        }
+        return out
+    }
+}
+
+/// Такт по кадрам встроенного экрана (120 Гц на ProMotion), идёт и при
+/// открытом меню. Сам останавливается, когда двигатель дошёл до цели.
+final class FrameClock: NSObject {
+
+    private let screenID: CGDirectDisplayID
+    private let tick: (Double) -> Void
+    private var link: CADisplayLink?
+    private var last: CFTimeInterval = 0
+    var isRunning: Bool { link != nil }
+
+    init(screen: CGDirectDisplayID, tick: @escaping (Double) -> Void) {
+        screenID = screen
+        self.tick = tick
+    }
+
+    func start() {
+        guard link == nil else { return }
+        let screen = NSScreen.screens.first { $0.displayID == screenID } ?? NSScreen.main
+        guard let l = screen?.displayLink(target: self, selector: #selector(frame(_:))) else { return }
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        l.add(to: .main, forMode: .common)
+        last = 0
+        link = l
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc private func frame(_ l: CADisplayLink) {
+        let dt = last == 0 ? 1.0 / 120 : min(l.timestamp - last, 1.0 / 30)
+        last = l.timestamp
+        tick(dt)
     }
 }
 
